@@ -1,5 +1,8 @@
 name: Nightly Benchmark
 
+permissions:
+  contents: read
+
 on:
   schedule:
     # Run at 2 AM UTC every day
@@ -23,6 +26,8 @@ jobs:
   benchmark:
     name: Run Comprehensive Benchmark
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout code
@@ -202,6 +207,9 @@ jobs:
     needs: benchmark
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule'
+    permissions:
+      contents: read
+      issues: write
 
     steps:
       - name: Checkout code
