@@ -50,7 +50,11 @@ func RunCommand(binary string, args []string, outputFile string) (time.Duration,
 		if err != nil {
 			return 0, err
 		}
-		defer out.Close()
+		defer func() {
+			if closeErr := out.Close(); closeErr != nil {
+				fmt.Printf("warning: failed to close output file: %v\n", closeErr)
+			}
+		}()
 		cmd.Stdout = out
 	}
 
