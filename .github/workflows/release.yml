@@ -1,0 +1,204 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+          - os: linux
+            arch: arm64
+          - os: darwin
+            arch: amd64
+          - os: darwin
+            arch: arm64
+          - os: windows
+            arch: amd64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Get version
+        id: version
+        run: |
+          echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          echo "TAG=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          BUILD_TIME=$(date -u '+%Y-%m-%d_%H:%M:%S')
+          LDFLAGS="-X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME}"
+          
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            BINARY_NAME="compstat-${{ matrix.os }}-${{ matrix.arch }}.exe"
+          else
+            BINARY_NAME="compstat-${{ matrix.os }}-${{ matrix.arch }}"
+          fi
+          
+          go build -ldflags "${LDFLAGS}" -o ${BINARY_NAME} ./cmd/compstat
+          
+          # Create checksum
+          if [ "${{ matrix.os }}" = "darwin" ]; then
+            shasum -a 256 ${BINARY_NAME} > ${BINARY_NAME}.sha256
+          else
+            sha256sum ${BINARY_NAME} > ${BINARY_NAME}.sha256
+          fi
+
+      - name: Create archive
+        run: |
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            BINARY_NAME="compstat-${{ matrix.os }}-${{ matrix.arch }}.exe"
+            ARCHIVE_NAME="compstat-${{ steps.version.outputs.TAG }}-${{ matrix.os }}-${{ matrix.arch }}.zip"
+            zip ${ARCHIVE_NAME} ${BINARY_NAME} ${BINARY_NAME}.sha256 README.md LICENSE
+          else
+            BINARY_NAME="compstat-${{ matrix.os }}-${{ matrix.arch }}"
+            ARCHIVE_NAME="compstat-${{ steps.version.outputs.TAG }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz"
+            tar czf ${ARCHIVE_NAME} ${BINARY_NAME} ${BINARY_NAME}.sha256 README.md LICENSE
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: binaries-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            compstat-*
+            *.tar.gz
+            *.zip
+
+  create-release:
+    name: Create Release
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: artifacts
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Get previous tag
+          PREV_TAG=$(git describe --abbrev=0 --tags $(git rev-list --tags --skip=1 --max-count=1) 2>/dev/null || echo "")
+          
+          if [ -z "$PREV_TAG" ]; then
+            echo "CHANGELOG<<EOF" >> $GITHUB_OUTPUT
+            echo "Initial release" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          else
+            echo "CHANGELOG<<EOF" >> $GITHUB_OUTPUT
+            git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)" >> $GITHUB_OUTPUT
+            echo "" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: artifacts/**/*
+          body: |
+            ## compstat ${{ github.ref_name }}
+            
+            ### Downloads
+            
+            Choose the appropriate binary for your platform:
+            - **Linux AMD64**: `compstat-linux-amd64`
+            - **Linux ARM64**: `compstat-linux-arm64`
+            - **macOS Intel**: `compstat-darwin-amd64`
+            - **macOS Apple Silicon**: `compstat-darwin-arm64`
+            - **Windows**: `compstat-windows-amd64.exe`
+            
+            ### Installation
+            
+            ```bash
+            # Linux/macOS
+            tar xzf compstat-*.tar.gz
+            chmod +x compstat-*
+            sudo mv compstat-* /usr/local/bin/compstat
+            
+            # Windows
+            unzip compstat-*.zip
+            # Add to PATH
+            ```
+            
+            ### Verify Download
+            
+            ```bash
+            sha256sum -c compstat-*.sha256
+            ```
+            
+            ### Changes
+            
+            ${{ steps.changelog.outputs.CHANGELOG }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-docker:
+    name: Publish Docker Image
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

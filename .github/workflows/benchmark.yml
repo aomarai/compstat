@@ -1,0 +1,271 @@
+name: Nightly Benchmark
+
+on:
+  schedule:
+    # Run at 2 AM UTC every day
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      file_sizes:
+        description: 'Comma-separated file sizes in MB (e.g., 10,100,1000)'
+        required: false
+        default: '10,100,1000'
+      iterations:
+        description: 'Number of iterations per test'
+        required: false
+        default: '5'
+      parallelism:
+        description: 'Number of parallel jobs'
+        required: false
+        default: '4'
+
+jobs:
+  benchmark:
+    name: Run Comprehensive Benchmark
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Build binary
+        run: |
+          make build
+
+      - name: Install compression tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd xz-utils pigz lz4 pbzip2 brotli
+
+      - name: Print tool versions
+        run: |
+          echo "=== Compression Tool Versions ==="
+          zstd --version || echo "zstd not found"
+          xz --version || echo "xz not found"
+          pigz --version 2>&1 | head -1 || echo "pigz not found"
+          lz4 --version || echo "lz4 not found"
+          pbzip2 -V 2>&1 | head -1 || echo "pbzip2 not found"
+          brotli --version || echo "brotli not found"
+
+      - name: Create test files
+        run: |
+          mkdir -p testdata
+          
+          # Parse file sizes from input or use defaults
+          FILE_SIZES="${{ github.event.inputs.file_sizes || '10,100,1000' }}"
+          IFS=',' read -ra SIZES <<< "$FILE_SIZES"
+          
+          for size in "${SIZES[@]}"; do
+            echo "Creating ${size}MB test file..."
+            dd if=/dev/urandom of=testdata/test_${size}mb.bin bs=1M count=${size}
+          done
+          
+          ls -lh testdata/
+
+      - name: Run benchmarks
+        run: |
+          ITERATIONS="${{ github.event.inputs.iterations || '5' }}"
+          PARALLELISM="${{ github.event.inputs.parallelism || '4' }}"
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          
+          # Get list of test files
+          FILES=$(ls testdata/*.bin | tr '\n' ',' | sed 's/,$//')
+          
+          echo "Running benchmarks with ${ITERATIONS} iterations and ${PARALLELISM} parallel jobs"
+          
+          ./compstat \
+            -files "${FILES}" \
+            -codecs zstd,xz,gzip,lz4,bzip2,brotli \
+            -iterations ${ITERATIONS} \
+            -parallelism ${PARALLELISM} \
+            -output benchmark_${TIMESTAMP}.csv \
+            -json benchmark_${TIMESTAMP}.json \
+            -compress-threads $(nproc) \
+            -decompress-threads $(nproc)
+          
+          echo "TIMESTAMP=${TIMESTAMP}" >> $GITHUB_ENV
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          pip install pandas matplotlib seaborn plotly
+
+      - name: Generate analysis
+        run: |
+          python python/analyze.py benchmark_${TIMESTAMP}.csv \
+            --summary \
+            --pareto \
+            --output analysis_${TIMESTAMP}.csv
+
+      - name: Generate visualizations
+        run: |
+          mkdir -p plots_${TIMESTAMP}
+          python python/visualize.py benchmark_${TIMESTAMP}.csv \
+            --output-dir plots_${TIMESTAMP}
+
+      - name: Create benchmark report
+        run: |
+          cat > benchmark_report_${TIMESTAMP}.md << 'EOF'
+          # Benchmark Report - $(date +%Y-%m-%d)
+          
+          ## System Information
+          - **OS**: $(uname -s) $(uname -r)
+          - **CPU**: $(lscpu | grep "Model name" | cut -d: -f2 | xargs)
+          - **CPU Cores**: $(nproc)
+          - **Memory**: $(free -h | awk '/^Mem:/ {print $2}')
+          
+          ## Test Configuration
+          - **Iterations**: ${{ github.event.inputs.iterations || '5' }}
+          - **Parallelism**: ${{ github.event.inputs.parallelism || '4' }}
+          - **File Sizes**: ${{ github.event.inputs.file_sizes || '10,100,1000' }} MB
+          
+          ## Tool Versions
+          $(zstd --version 2>&1 | head -1)
+          $(xz --version 2>&1 | head -1)
+          $(pigz --version 2>&1 | head -1)
+          $(lz4 --version 2>&1 | head -1)
+          $(pbzip2 -V 2>&1 | head -1)
+          $(brotli --version 2>&1 | head -1)
+          
+          ## Results Summary
+          
+          See attached CSV files and plots for detailed results.
+          
+          ### Top Performers by Metric
+          
+          #### Best Compression Ratio
+          \`\`\`
+          $(python3 -c "import pandas as pd; df = pd.read_csv('benchmark_${TIMESTAMP}.csv'); print(df.nsmallest(5, 'compression_ratio')[['algorithm', 'level', 'compression_ratio', 'file_path']].to_string(index=False))")
+          \`\`\`
+          
+          #### Fastest Compression
+          \`\`\`
+          $(python3 -c "import pandas as pd; df = pd.read_csv('benchmark_${TIMESTAMP}.csv'); print(df.nlargest(5, 'compression_speed_mbs')[['algorithm', 'level', 'compression_speed_mbs', 'file_path']].to_string(index=False))")
+          \`\`\`
+          
+          #### Fastest Decompression
+          \`\`\`
+          $(python3 -c "import pandas as pd; df = pd.read_csv('benchmark_${TIMESTAMP}.csv'); print(df.nlargest(5, 'decompression_speed_mbs')[['algorithm', 'level', 'decompression_speed_mbs', 'file_path']].to_string(index=False))")
+          \`\`\`
+          EOF
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v3
+        with:
+          name: benchmark-results-${{ env.TIMESTAMP }}
+          path: |
+            benchmark_${{ env.TIMESTAMP }}.csv
+            benchmark_${{ env.TIMESTAMP }}.json
+            analysis_${{ env.TIMESTAMP }}.csv
+            plots_${{ env.TIMESTAMP }}/
+            benchmark_report_${{ env.TIMESTAMP }}.md
+          retention-days: 90
+
+      - name: Commit results to repo (optional)
+        if: github.event_name == 'schedule'
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          
+          # Create benchmarks directory if it doesn't exist
+          mkdir -p benchmarks
+          
+          # Move results to benchmarks directory
+          mv benchmark_${TIMESTAMP}.csv benchmarks/
+          mv benchmark_${TIMESTAMP}.json benchmarks/
+          mv analysis_${TIMESTAMP}.csv benchmarks/
+          mv plots_${TIMESTAMP}/ benchmarks/
+          mv benchmark_report_${TIMESTAMP}.md benchmarks/
+          
+          # Keep only last 30 days of benchmarks
+          find benchmarks/ -name "benchmark_*.csv" -mtime +30 -delete
+          find benchmarks/ -name "benchmark_*.json" -mtime +30 -delete
+          find benchmarks/ -name "analysis_*.csv" -mtime +30 -delete
+          find benchmarks/ -type d -name "plots_*" -mtime +30 -exec rm -rf {} +
+          find benchmarks/ -name "benchmark_report_*.md" -mtime +30 -delete
+          
+          git add benchmarks/
+          git commit -m "Add benchmark results for ${TIMESTAMP}" || echo "No changes to commit"
+          git push
+
+  benchmark-comparison:
+    name: Compare with Previous Benchmarks
+    needs: benchmark
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install pandas matplotlib
+
+      - name: Compare results
+        run: |
+          # Get last two benchmark files
+          LATEST=$(ls -t benchmarks/benchmark_*.csv 2>/dev/null | head -1)
+          PREVIOUS=$(ls -t benchmarks/benchmark_*.csv 2>/dev/null | head -2 | tail -1)
+          
+          if [ -n "$LATEST" ] && [ -n "$PREVIOUS" ]; then
+            echo "Comparing $LATEST with $PREVIOUS"
+          
+            python3 << 'PYTHON_SCRIPT'
+          import pandas as pd
+          import sys
+          
+          latest = pd.read_csv("${LATEST}")
+          previous = pd.read_csv("${PREVIOUS}")
+          
+          # Group by algorithm and level
+          latest_avg = latest.groupby(['algorithm', 'level']).agg({
+              'compression_ratio': 'mean',
+              'compression_speed_mbs': 'mean'
+          })
+          
+          previous_avg = previous.groupby(['algorithm', 'level']).agg({
+              'compression_ratio': 'mean',
+              'compression_speed_mbs': 'mean'
+          })
+          
+          # Calculate differences
+          diff = latest_avg - previous_avg
+          
+          print("\n=== Performance Changes ===")
+          print("\nCompression Ratio Changes (negative = better):")
+          print(diff['compression_ratio'].sort_values().head(10))
+          
+          print("\nSpeed Changes (positive = better):")
+          print(diff['compression_speed_mbs'].sort_values(ascending=False).head(10))
+          PYTHON_SCRIPT
+          fi
+
+      - name: Create issue if performance degrades
+        if: failure()
+        uses: actions/github-script@v6
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '⚠️ Performance Degradation Detected',
+              body: 'The nightly benchmark detected performance degradation. Please review the benchmark results.',
+              labels: ['benchmark', 'performance']
+            })

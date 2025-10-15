@@ -1,0 +1,148 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Cache Go modules
+        uses: actions/cache@v3
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Run tests
+        run: go test -v -race -coverprofile=coverage.out ./...
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.out
+          flags: unittests
+          name: codecov-umbrella
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Build binary
+        run: |
+          make build
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: compstat-linux-amd64
+          path: compstat
+
+  benchmark:
+    name: Run Benchmarks
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v3
+        with:
+          name: compstat-linux-amd64
+
+      - name: Make binary executable
+        run: chmod +x compstat
+
+      - name: Install compression tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd xz-utils pigz lz4 pbzip2 brotli
+
+      - name: Create test file
+        run: |
+          # Create a 100MB test file with random data
+          dd if=/dev/urandom of=test.bin bs=1M count=100
+
+      - name: Run benchmark
+        run: |
+          ./compstat \
+            -files test.bin \
+            -codecs zstd,xz,gzip,lz4,bzip2,brotli \
+            -iterations 3 \
+            -parallelism 2 \
+            -output benchmark_results.csv \
+            -json benchmark_results.json
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v3
+        with:
+          name: benchmark-results
+          path: |
+            benchmark_results.csv
+            benchmark_results.json
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          pip install pandas matplotlib seaborn
+
+      - name: Generate analysis
+        run: |
+          python python/analyze.py benchmark_results.csv --summary --pareto --output analysis.csv
+
+      - name: Generate visualizations
+        run: |
+          python python/visualize.py benchmark_results.csv --output-dir plots
+
+      - name: Upload analysis artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: analysis-results
+          path: |
+            analysis.csv
+            plots/
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v3
+        with:
+          version: latest
+          args: --timeout=5m
