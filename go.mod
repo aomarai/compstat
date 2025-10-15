@@ -1,3 +1,3 @@
 module github.com/aomarai/compstat
 
-go 1.25
+go 1.23
