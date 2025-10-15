@@ -61,7 +61,9 @@ func (r *Runner) Close() {
 		r.csvWriter.Flush()
 	}
 	if r.csvFile != nil {
-		r.csvFile.Close()
+		if err := r.csvFile.Close(); err != nil {
+			fmt.Printf("warning: failed to close CSV file: %v\n", err)
+		}
 	}
 }
 
@@ -80,7 +82,9 @@ func (r *Runner) writeCSVHeader() {
 		"decompression_speed_mbs", "compression_max_rss_mb", "decompression_max_rss_mb",
 		"verified", "iteration",
 	}
-	r.csvWriter.Write(header)
+	if err := r.csvWriter.Write(header); err != nil {
+		fmt.Printf("warning: failed to write CSV header: %v\n", err)
+	}
 	r.csvWriter.Flush()
 }
 
@@ -261,14 +265,18 @@ func (r *Runner) runSingleBenchmark(j job) *Result {
 	compTime, err := util.RunCommand(c.Binary(), compCmd, compOut)
 	if err != nil {
 		fmt.Printf("  ! Compression failed: %v\n", err)
-		os.Remove(compOut)
+		if removeErr := os.Remove(compOut); removeErr != nil && !os.IsNotExist(removeErr) {
+			fmt.Printf("  warning: failed to remove compressed file: %v\n", removeErr)
+		}
 		return nil
 	}
 
 	compSize, err := util.FileSize(compOut)
 	if err != nil {
 		fmt.Printf("  ! Failed to get compressed size: %v\n", err)
-		os.Remove(compOut)
+		if removeErr := os.Remove(compOut); removeErr != nil && !os.IsNotExist(removeErr) {
+			fmt.Printf("  warning: failed to remove compressed file: %v\n", removeErr)
+		}
 		return nil
 	}
 
@@ -316,11 +324,15 @@ func (r *Runner) runSingleBenchmark(j job) *Result {
 				}
 			}
 		}
-		os.Remove(decompOut)
+		if err := os.Remove(decompOut); err != nil && !os.IsNotExist(err) {
+			fmt.Printf("  warning: failed to remove decompressed file: %v\n", err)
+		}
 	}
 
 	// Cleanup
-	os.Remove(compOut)
+	if err := os.Remove(compOut); err != nil && !os.IsNotExist(err) {
+		fmt.Printf("  warning: failed to remove compressed file: %v\n", err)
+	}
 
 	return result
 }
